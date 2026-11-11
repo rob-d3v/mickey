@@ -247,6 +247,9 @@ pub fn run(
         return Err("another mickey source is already running".into());
     }
     let input = Input::open()?;
+    // For text expanders, when asked for (see `input::TypingMirror`).
+    #[cfg(target_os = "linux")]
+    let mut mirror = crate::input::typing_mirror();
     let data_dir = identity::data_dir()?;
     let identity = Identity::load_or_create(&data_dir)?;
     let start = Instant::now();
@@ -643,6 +646,10 @@ pub fn run(
                     && link.send(&Message::Input(event)).is_err()
                 {
                     lost.push(index);
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(mirror) = &mut mirror {
+                    mirror.typed(event);
                 }
             }
             Action::Ungrab => {

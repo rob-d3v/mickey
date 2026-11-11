@@ -5,29 +5,38 @@ use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
+/// `ioctl`'s request is C's `unsigned long`: 64 bits on 64-bit Linux, 32 on
+/// 32-bit (a Raspberry Pi with a 32-bit system). Declared any wider there,
+/// the arguments after it would land in the wrong registers.
+pub(super) type Request = std::ffi::c_ulong;
+
 // ioctl numbers from <linux/input.h>, expanded from the _IOW/_IOR macros.
 // `_IOR` puts the buffer size in bits 16..30, hence the `<< 16`.
-const EVIOCGRAB: u64 = 0x4004_4590;
+const EVIOCGRAB: Request = 0x4004_4590;
 const BITS_BYTES: usize = 96; // KEY_MAX (0x2ff) + 1 bits, the largest bitmap
-const EVIOCGKEY: u64 = 0x8000_4518 | ((BITS_BYTES as u64) << 16);
+const EVIOCGKEY: Request = 0x8000_4518 | ((BITS_BYTES as Request) << 16);
 const NAME_BYTES: usize = 256;
-const EVIOCGNAME: u64 = 0x8000_4506 | ((NAME_BYTES as u64) << 16);
+const EVIOCGNAME: Request = 0x8000_4506 | ((NAME_BYTES as Request) << 16);
 /// `EVIOCGABS(axis)`: one axis' `struct input_absinfo`, six `i32`s.
 const ABSINFO_BYTES: usize = 24;
-const fn eviocgabs(axis: u16) -> u64 {
-    (0x8000_4540 + axis as u64) | ((ABSINFO_BYTES as u64) << 16)
+const fn eviocgabs(axis: u16) -> Request {
+    (0x8000_4540 + axis as Request) | ((ABSINFO_BYTES as Request) << 16)
 }
 /// `EVIOCGBIT(ev_type)`: which codes of one event type the device has.
-const fn eviocgbit(ev_type: u16) -> u64 {
-    (0x8000_4520 + ev_type as u64) | ((BITS_BYTES as u64) << 16)
+const fn eviocgbit(ev_type: u16) -> Request {
+    (0x8000_4520 + ev_type as Request) | ((BITS_BYTES as Request) << 16)
 }
 
-// `struct input_event` on 64-bit Linux: a 16-byte timeval, then type, code, value.
-const EVENT_SIZE: usize = 24;
+/// `struct input_event` starts with a timeval of two C `long`s: 16 bytes on
+/// 64-bit Linux, 8 on 32-bit (also for a 32-bit program on a 64-bit kernel,
+/// which the kernel serves the 32-bit layout).
+pub(super) const EVENT_TIME: usize = 2 * std::mem::size_of::<std::ffi::c_long>();
+/// Then type (2 bytes), code (2) and value (4).
+pub(super) const EVENT_SIZE: usize = EVENT_TIME + 8;
 
 unsafe extern "C" {
     /// Shared with `uinput.rs`.
-    pub(super) fn ioctl(fd: i32, request: u64, ...) -> i32;
+    pub(super) fn ioctl(fd: i32, request: Request, ...) -> i32;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,10 +69,11 @@ impl Device {
         }
         into.clear();
         let (events, _) = buf[..read].as_chunks::<EVENT_SIZE>();
+        const T: usize = EVENT_TIME;
         into.extend(events.iter().map(|e| RawEvent {
-            kind: u16::from_ne_bytes([e[16], e[17]]),
-            code: u16::from_ne_bytes([e[18], e[19]]),
-            value: i32::from_ne_bytes([e[20], e[21], e[22], e[23]]),
+            kind: u16::from_ne_bytes([e[T], e[T + 1]]),
+            code: u16::from_ne_bytes([e[T + 2], e[T + 3]]),
+            value: i32::from_ne_bytes([e[T + 4], e[T + 5], e[T + 6], e[T + 7]]),
         }));
         Ok(())
     }
@@ -105,7 +115,7 @@ impl Device {
         Ok(String::from_utf8_lossy(name).into_owned())
     }
 
-    fn bitmap(&self, request: u64) -> io::Result<[u8; BITS_BYTES]> {
+    fn bitmap(&self, request: Request) -> io::Result<[u8; BITS_BYTES]> {
         let mut bits = [0u8; BITS_BYTES];
         self.ioctl_read(request, &mut bits)?;
         Ok(bits)
@@ -113,8 +123,8 @@ impl Device {
 
     /// Runs a read ioctl whose size field equals `buf.len()`; returns the
     /// number of bytes the kernel wrote.
-    fn ioctl_read(&self, request: u64, buf: &mut [u8]) -> io::Result<usize> {
-        debug_assert_eq!((request >> 16) & 0x3fff, buf.len() as u64);
+    fn ioctl_read(&self, request: Request, buf: &mut [u8]) -> io::Result<usize> {
+        debug_assert_eq!((request >> 16) & 0x3fff, buf.len() as Request);
         // SAFETY: every caller passes a request whose size field is
         // `buf.len()`, so the kernel writes at most that many bytes into
         // `buf`, which lives for the whole call. The fd is open as long as
@@ -126,24 +136,12 @@ impl Device {
         Ok(written as usize)
     }
 
-    /// Takes the device away from the desktop until the guard is dropped.
-    pub fn grab(&self) -> io::Result<Grab<'_>> {
-        set_grab(&self.file, true)?;
-        Ok(Grab { file: &self.file })
-    }
-}
-
-/// Releases the grab when dropped, including during a panic. If the process
-/// is killed, the kernel releases it when the file is closed.
-pub struct Grab<'a> {
-    file: &'a File,
-}
-
-impl Drop for Grab<'_> {
-    fn drop(&mut self) {
-        if let Err(err) = set_grab(self.file, false) {
-            eprintln!("mickey: failed to release the grab: {err}");
-        }
+    /// Takes the device away from the desktop (`on`), or gives it back.
+    /// `input::Grabbed` gives every device back when it is dropped,
+    /// including during a panic. If the process is killed, the kernel
+    /// releases the grab when the file is closed.
+    pub fn set_grab(&self, on: bool) -> io::Result<()> {
+        set_grab(&self.file, on)
     }
 }
 

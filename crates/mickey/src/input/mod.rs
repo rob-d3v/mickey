@@ -20,6 +20,8 @@ use std::sync::mpsc::Sender;
 #[cfg(target_os = "linux")]
 pub use linux::Input;
 #[cfg(target_os = "linux")]
+pub use linux::typing_mirror;
+#[cfg(target_os = "linux")]
 pub use linux::cursor_now;
 #[cfg(windows)]
 pub use windows::Input;
@@ -30,15 +32,93 @@ pub use windows::cursor_now;
 mod linux {
     use super::*;
     use crate::input::capture;
-    use crate::platform::linux::Grab;
+    use crate::platform::uinput::{EV_KEY, MIRROR_NAME, VirtualDevice};
+    use crate::threads::LockAnyway;
+    use std::marker::PhantomData;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     pub struct Input {
-        devices: Vec<capture::Found>,
+        /// Shared with `capture::watch`, which adds the devices plugged in
+        /// later and drops the ones unplugged.
+        devices: Arc<Mutex<Vec<capture::Found>>>,
+        grabbed: Arc<AtomicBool>,
     }
 
-    /// While this lives, the devices are taken from the desktop.
+    /// While this lives, the devices are taken from the desktop. Dropping
+    /// it gives them back, including during a panic.
     pub struct Grabbed<'a> {
-        _grabs: Vec<Grab<'a>>,
+        devices: Arc<Mutex<Vec<capture::Found>>>,
+        grabbed: Arc<AtomicBool>,
+        _input: PhantomData<&'a Input>,
+    }
+
+    impl Drop for Grabbed<'_> {
+        fn drop(&mut self) {
+            let list = self.devices.lock_anyway();
+            self.grabbed.store(false, Ordering::Relaxed);
+            for found in list.iter() {
+                // One unplugged meanwhile has no grab left to release.
+                if let Err(err) = found.device.set_grab(false)
+                    && found.alive.load(Ordering::Relaxed)
+                {
+                    eprintln!("mickey: failed to release the grab: {err}");
+                }
+            }
+        }
+    }
+
+    /// How long after a text expander typed its keys are still taken for
+    /// its own: its presses in that time are not repeated on the mirror.
+    const EXPANDER_QUIET: Duration = Duration::from_millis(60);
+
+    /// What is typed for another PC, repeated on a keyboard of this PC that
+    /// only text expanders read (PRD: none yet; omakvm's espanso support).
+    ///
+    /// A text expander such as espanso reads the keyboards itself. While
+    /// the focus is on another PC they are grabbed, so it hears nothing and
+    /// its triggers stop working. With the mirror it hears them again; what
+    /// it then types comes out of its own virtual keyboard, which Mickey
+    /// captures like any other and sends to the focused PC. The desktop
+    /// must not read the mirror, or the keys would also be typed here: a
+    /// udev rule gives it `LIBINPUT_IGNORE_DEVICE`.
+    pub struct TypingMirror {
+        device: VirtualDevice,
+    }
+
+    /// The mirror, when `MICKEY_TYPING_MIRROR=1` is in the environment.
+    pub fn typing_mirror() -> Option<TypingMirror> {
+        if std::env::var_os("MICKEY_TYPING_MIRROR").is_none_or(|value| value != "1") {
+            return None;
+        }
+        match VirtualDevice::create_keyboard(MIRROR_NAME) {
+            Ok(device) => {
+                println!("mickey: typing mirror on, for text expanders");
+                Some(TypingMirror { device })
+            }
+            Err(err) => {
+                eprintln!("mickey: no typing mirror: {err}");
+                None
+            }
+        }
+    }
+
+    impl TypingMirror {
+        /// Repeats a key that was just sent to the focused PC. Releases
+        /// always pass, so no key stays down on the mirror; presses that
+        /// are the expander's own typing do not.
+        pub fn typed(&mut self, event: InputEvent) {
+            let InputEvent::Key { code, pressed } = event else {
+                return;
+            };
+            if pressed && capture::expander_typed_within(EXPANDER_QUIET) {
+                return;
+            }
+            self.device.emit(EV_KEY, code, i32::from(pressed));
+            // A failed write only costs the expander a key.
+            let _ = self.device.sync();
+        }
     }
 
     /// Where the cursor is: a question to Hyprland or the X server,
@@ -73,7 +153,10 @@ mod linux {
                 };
                 println!("mickey: found {kind}: {}", found.name);
             }
-            Ok(Input { devices })
+            Ok(Input {
+                devices: Arc::new(Mutex::new(devices)),
+                grabbed: Arc::new(AtomicBool::new(false)),
+            })
         }
 
         pub fn start<T: From<InputEvent> + Send + 'static>(
@@ -81,31 +164,57 @@ mod linux {
             events: Sender<T>,
             touchpad_speed: i32,
         ) -> Result<(), String> {
-            capture::spawn_readers(&self.devices, events, touchpad_speed);
+            capture::spawn_readers(&self.devices.lock_anyway(), events.clone(), touchpad_speed);
+            capture::watch(
+                Arc::clone(&self.devices),
+                Arc::clone(&self.grabbed),
+                events,
+                touchpad_speed,
+            );
             Ok(())
         }
 
+        /// A device that cannot answer counts as down, unless it is gone.
         pub fn any_key_down(&self) -> bool {
-            self.devices
-                .iter()
-                .any(|found| found.device.any_key_down().unwrap_or(true))
+            self.devices.lock_anyway().iter().any(|found| {
+                found
+                    .device
+                    .any_key_down()
+                    .unwrap_or_else(|_| found.alive.load(Ordering::Relaxed))
+            })
         }
 
         pub fn button_down(&self) -> bool {
-            self.devices
-                .iter()
-                .any(|found| found.device.button_down().unwrap_or(true))
+            self.devices.lock_anyway().iter().any(|found| {
+                found
+                    .device
+                    .button_down()
+                    .unwrap_or_else(|_| found.alive.load(Ordering::Relaxed))
+            })
         }
 
-        /// Where the cursor is on this desktop, if the compositor says.
+        /// Takes every device from the desktop until the guard is dropped.
         pub fn grab(&self) -> Result<Grabbed<'_>, String> {
-            let grabs = self
-                .devices
-                .iter()
-                .map(|found| found.device.grab())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|err| format!("cannot grab the input devices: {err}"))?;
-            Ok(Grabbed { _grabs: grabs })
+            // Held until the flag is set: see `capture::watch`.
+            let list = self.devices.lock_anyway();
+            for (index, found) in list.iter().enumerate() {
+                // One just unplugged, whose reader has not noticed yet, is
+                // no reason to refuse the switch.
+                if let Err(err) = found.device.set_grab(true)
+                    && err.raw_os_error() != Some(19)
+                {
+                    for taken in &list[..index] {
+                        let _ = taken.device.set_grab(false);
+                    }
+                    return Err(format!("cannot grab the input devices: {err}"));
+                }
+            }
+            self.grabbed.store(true, Ordering::Relaxed);
+            Ok(Grabbed {
+                devices: Arc::clone(&self.devices),
+                grabbed: Arc::clone(&self.grabbed),
+                _input: PhantomData,
+            })
         }
     }
 }

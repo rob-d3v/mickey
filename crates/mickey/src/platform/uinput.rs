@@ -2,7 +2,7 @@
 //! hands their events to the compositor exactly like a real device's, so
 //! this works on any Linux desktop (PRD 0008).
 
-use super::linux::ioctl;
+use super::linux::{EVENT_SIZE, EVENT_TIME, Request, ioctl};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -10,14 +10,18 @@ use std::os::fd::AsRawFd;
 const PATH: &str = "/dev/uinput";
 /// The name Mickey gives its virtual device, so capture can skip it.
 pub const DEVICE_NAME: &str = "Mickey virtual input";
+/// The keyboard that repeats on this PC what is typed for another one, for
+/// text expanders to read (`input::TypingMirror`). Capture skips it too, and
+/// a udev rule keeps the desktop from reading it.
+pub const MIRROR_NAME: &str = "Mickey typing mirror";
 
 // ioctl numbers from <linux/uinput.h>, checked against the C headers.
-const UI_SET_EVBIT: u64 = 0x4004_5564;
-const UI_SET_KEYBIT: u64 = 0x4004_5565;
-const UI_SET_RELBIT: u64 = 0x4004_5566;
-const UI_DEV_SETUP: u64 = 0x405c_5503;
-const UI_DEV_CREATE: u64 = 0x5501;
-const UI_DEV_DESTROY: u64 = 0x5502;
+const UI_SET_EVBIT: Request = 0x4004_5564;
+const UI_SET_KEYBIT: Request = 0x4004_5565;
+const UI_SET_RELBIT: Request = 0x4004_5566;
+const UI_DEV_SETUP: Request = 0x405c_5503;
+const UI_DEV_CREATE: Request = 0x5501;
+const UI_DEV_DESTROY: Request = 0x5502;
 
 pub const EV_SYN: u16 = 0;
 pub const EV_KEY: u16 = 1;
@@ -46,19 +50,33 @@ impl VirtualDevice {
     /// Creates the device. Fails with `PermissionDenied` unless the user
     /// may write to `/dev/uinput` (see the README's udev rule).
     pub fn create(name: &str) -> io::Result<VirtualDevice> {
+        VirtualDevice::create_with(name, true)
+    }
+
+    /// A keyboard only: no buttons, no motion.
+    pub fn create_keyboard(name: &str) -> io::Result<VirtualDevice> {
+        VirtualDevice::create_with(name, false)
+    }
+
+    fn create_with(name: &str, mouse: bool) -> io::Result<VirtualDevice> {
         let file = OpenOptions::new().write(true).open(PATH)?;
         let device = VirtualDevice {
             file,
-            batch: Vec::with_capacity(4 * 24),
+            batch: Vec::with_capacity(4 * EVENT_SIZE),
         };
-        for kind in [EV_SYN, EV_KEY, EV_REL] {
-            device.set(UI_SET_EVBIT, kind)?;
-        }
-        for code in KEYS.chain(BUTTONS) {
+        device.set(UI_SET_EVBIT, EV_SYN)?;
+        device.set(UI_SET_EVBIT, EV_KEY)?;
+        for code in KEYS {
             device.set(UI_SET_KEYBIT, code)?;
         }
-        for axis in AXES {
-            device.set(UI_SET_RELBIT, axis)?;
+        if mouse {
+            device.set(UI_SET_EVBIT, EV_REL)?;
+            for code in BUTTONS {
+                device.set(UI_SET_KEYBIT, code)?;
+            }
+            for axis in AXES {
+                device.set(UI_SET_RELBIT, axis)?;
+            }
         }
 
         let mut setup = [0u8; SETUP_LEN];
@@ -80,12 +98,13 @@ impl VirtualDevice {
     /// Queues one event; it reaches the kernel with the rest of its batch,
     /// at `sync`.
     pub fn emit(&mut self, kind: u16, code: u16, value: i32) {
-        // `struct input_event` on 64-bit Linux: a 16-byte timeval (zero:
-        // the kernel stamps it), type, code, value.
-        let mut event = [0u8; 24];
-        event[16..18].copy_from_slice(&kind.to_ne_bytes());
-        event[18..20].copy_from_slice(&code.to_ne_bytes());
-        event[20..24].copy_from_slice(&value.to_ne_bytes());
+        // `struct input_event`: a timeval (zero: the kernel stamps it),
+        // then type, code, value. See `linux::EVENT_TIME` for its size.
+        const T: usize = EVENT_TIME;
+        let mut event = [0u8; EVENT_SIZE];
+        event[T..T + 2].copy_from_slice(&kind.to_ne_bytes());
+        event[T + 2..T + 4].copy_from_slice(&code.to_ne_bytes());
+        event[T + 4..T + 8].copy_from_slice(&value.to_ne_bytes());
         self.batch.extend_from_slice(&event);
     }
 
@@ -99,7 +118,7 @@ impl VirtualDevice {
         written
     }
 
-    fn set(&self, request: u64, code: u16) -> io::Result<()> {
+    fn set(&self, request: Request, code: u16) -> io::Result<()> {
         // SAFETY: the UI_SET_* requests take an int by value, not a
         // pointer; the fd is open for as long as `self`.
         check(unsafe { ioctl(self.fd(), request, i32::from(code)) })

@@ -3,10 +3,14 @@
 
 use crate::input::event::InputEvent;
 use crate::platform::linux::{Device, RawEvent};
+use crate::threads::LockAnyway;
+use std::collections::HashSet;
 use std::io;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
@@ -44,9 +48,37 @@ pub struct Found {
     pub device: Arc<Device>,
     pub name: String,
     pub kind: Kind,
+    /// Its node under `/dev/input`, to tell it from one plugged in later.
+    pub path: PathBuf,
+    /// Cleared by its reader thread when the device fails (unplugged).
+    pub alive: Arc<AtomicBool>,
+    /// A text expander's own virtual keyboard (espanso's): what it types is
+    /// not repeated on the typing mirror, or the expander would read itself.
+    expander: bool,
     hi_res_wheel: bool,
     /// Touchpad units per millimetre on X and Y.
     resolution: [i32; 2],
+}
+
+/// How often `watch` looks for devices plugged in after Mickey started.
+const WATCH_EVERY: Duration = Duration::from_secs(2);
+
+/// When a text expander's keyboard last typed, in milliseconds since the
+/// first call here; 0 means never.
+static EXPANDER_TYPED: AtomicU64 = AtomicU64::new(0);
+
+fn clock_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    // +1: 0 stays "never".
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Whether a text expander typed during the last `window`.
+pub fn expander_typed_within(window: Duration) -> bool {
+    match EXPANDER_TYPED.load(Ordering::Relaxed) {
+        0 => false,
+        at => clock_ms().saturating_sub(at) <= window.as_millis() as u64,
+    }
 }
 
 /// Opens every keyboard, mouse and touchpad under `/dev/input` (the kernel's
@@ -86,7 +118,10 @@ fn classify(path: &Path) -> io::Result<Option<Found>> {
     let device = Device::open(path)?;
     // Our own uinput device (a target in the same `mickey run`) carries
     // input that came from another PC; capturing it would send it back.
-    if device.name()? == crate::platform::uinput::DEVICE_NAME {
+    // The typing mirror repeats what was already captured.
+    let name = device.name()?;
+    if name == crate::platform::uinput::DEVICE_NAME || name == crate::platform::uinput::MIRROR_NAME
+    {
         return Ok(None);
     }
     let kind = if device.supports(EV_KEY, KEY_A)? && device.supports(EV_KEY, KEY_Z)? {
@@ -114,7 +149,10 @@ fn classify(path: &Path) -> io::Result<Option<Found>> {
         }
     }
     Ok(Some(Found {
-        name: device.name()?,
+        expander: name.to_lowercase().contains("espanso"),
+        name,
+        path: path.to_path_buf(),
+        alive: Arc::new(AtomicBool::new(true)),
         hi_res_wheel: device.supports(EV_REL, REL_WHEEL_HI_RES)?,
         kind,
         resolution,
@@ -133,24 +171,106 @@ pub fn spawn_readers<T: From<InputEvent> + Send + 'static>(
     touchpad_speed: i32,
 ) {
     for found in devices {
-        let device = Arc::clone(&found.device);
-        let events = events.clone();
-        let touchpad =
-            (found.kind == Kind::Touchpad).then(|| Touchpad::new(found.resolution, touchpad_speed));
-        let mut translator = Translator::new(found.hi_res_wheel, touchpad);
-        crate::threads::spawn("capture", move || {
-            let mut batch = Vec::with_capacity(64);
-            while device.read_events(&mut batch).is_ok() {
-                let mut closed = false;
-                for &raw in &batch {
-                    translator.feed(raw, |event| closed |= events.send(T::from(event)).is_err());
+        spawn_reader(found, events.clone(), touchpad_speed);
+    }
+}
+
+fn spawn_reader<T: From<InputEvent> + Send + 'static>(
+    found: &Found,
+    events: Sender<T>,
+    touchpad_speed: i32,
+) {
+    let device = Arc::clone(&found.device);
+    let alive = Arc::clone(&found.alive);
+    let expander = found.expander;
+    let touchpad =
+        (found.kind == Kind::Touchpad).then(|| Touchpad::new(found.resolution, touchpad_speed));
+    let mut translator = Translator::new(found.hi_res_wheel, touchpad);
+    crate::threads::spawn("capture", move || {
+        let mut batch = Vec::with_capacity(64);
+        while device.read_events(&mut batch).is_ok() {
+            if expander {
+                EXPANDER_TYPED.store(clock_ms(), Ordering::Relaxed);
+            }
+            let mut closed = false;
+            for &raw in &batch {
+                translator.feed(raw, |event| closed |= events.send(T::from(event)).is_err());
+            }
+            if closed {
+                break;
+            }
+        }
+        alive.store(false, Ordering::Relaxed);
+    });
+}
+
+/// Keeps `devices` true to what is plugged in: every `WATCH_EVERY`, a
+/// device whose reader ended (unplugged) leaves the list, and a keyboard,
+/// mouse or touchpad that appeared under `/dev/input` joins it with a
+/// reader of its own. Without this, a keyboard that drops off a USB hub and
+/// comes back, or a text expander that starts again with a new virtual
+/// keyboard, would be lost until Mickey restarts.
+///
+/// `grabbed` says whether the devices are taken from the desktop right
+/// now: one that joins meanwhile is taken too. It is read under the list's
+/// lock, which `Input::grab` holds while it grabs, so no device slips
+/// between the two.
+pub fn watch<T: From<InputEvent> + Send + 'static>(
+    devices: Arc<Mutex<Vec<Found>>>,
+    grabbed: Arc<AtomicBool>,
+    events: Sender<T>,
+    touchpad_speed: i32,
+) {
+    crate::threads::spawn("device watch", move || {
+        // Nodes that are neither keyboard, mouse nor touchpad: not asked again.
+        let mut other: HashSet<PathBuf> = HashSet::new();
+        loop {
+            std::thread::sleep(WATCH_EVERY);
+            let Ok(entries) = std::fs::read_dir("/dev/input") else {
+                continue;
+            };
+            let present: HashSet<PathBuf> = entries
+                .filter_map(|entry| Some(entry.ok()?.path()))
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("event"))
+                })
+                .collect();
+            other.retain(|path| present.contains(path));
+            let mut list = devices.lock_anyway();
+            list.retain(|found| {
+                let stays = found.alive.load(Ordering::Relaxed) && present.contains(&found.path);
+                if !stays {
+                    println!("mickey: {} is gone", found.name);
                 }
-                if closed {
-                    return;
+                stays
+            });
+            for path in &present {
+                if other.contains(path) || list.iter().any(|found| &found.path == path) {
+                    continue;
+                }
+                match classify(path) {
+                    Ok(Some(found)) => {
+                        if grabbed.load(Ordering::Relaxed)
+                            && let Err(err) = found.device.set_grab(true)
+                        {
+                            eprintln!("mickey: cannot grab {}: {err}", found.name);
+                        }
+                        println!("mickey: found {} (plugged in)", found.name);
+                        spawn_reader(&found, events.clone(), touchpad_speed);
+                        list.push(found);
+                    }
+                    Ok(None) => {
+                        other.insert(path.clone());
+                    }
+                    // Not ours to open yet (udev is still handing it to the
+                    // input group), or already gone: asked again next time.
+                    Err(_) => {}
                 }
             }
-        });
-    }
+        }
+    });
 }
 
 /// Raw evdev events to `InputEvent`s, for one device. Motion and wheel
