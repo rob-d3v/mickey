@@ -264,6 +264,14 @@ pub(super) fn serve_source(
         |effect| match output(effect) {
             Ok(()) => true,
             Err(err) => {
+                // omakvm: the X server went away (a kiosk restarting X with
+                // a new cookie). This connection never works again, and the
+                // cursor is no longer seen, so no edge leads home: end, and
+                // let the service start again with the new cookie.
+                if x_is_gone(&err) {
+                    eprintln!("mickey: the X server went away ({err}); ending so the service starts again");
+                    std::process::exit(1);
+                }
                 if !reported {
                     eprintln!("mickey: input injection failed: {err} (not reported again)");
                     reported = true;
@@ -279,4 +287,13 @@ pub(super) fn serve_source(
         Ok(()) => println!("mickey: source {peer} disconnected"),
         Err(err) => eprintln!("mickey: source {peer} dropped: {err}"),
     }
+}
+
+/// Whether an injection error says the X connection is gone for good.
+fn x_is_gone(err: &std::io::Error) -> bool {
+    std::env::var_os("DISPLAY").is_some()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+        && (err.kind() == std::io::ErrorKind::BrokenPipe
+            || err.kind() == std::io::ErrorKind::ConnectionReset
+            || err.to_string().contains("Broken pipe"))
 }
