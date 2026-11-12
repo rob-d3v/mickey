@@ -146,6 +146,38 @@ pub fn back(home: &[Monitor], position: [i32; 2], point: (i32, i32)) -> Option<(
     on_screen(home, here).then_some(here)
 }
 
+/// Where the cursor comes home when it pushed off the peer at `position`
+/// at `point` (a pixel just off the peer's `monitors`) but no monitor of
+/// this PC is right there: the peer's edge is longer than the stretch it
+/// shares with this desktop (a 1080 px tall peer next to a 720 px tall
+/// laptop screen). Without this the lower part of that edge led nowhere and
+/// the cursor was stuck over there. Only along the side it pushed through:
+/// out the left edge, the nearest point of a monitor of this PC in that
+/// column; out the top or bottom, in that row. Never across the desktop.
+pub fn back_near(
+    home: &[Monitor],
+    peer: &[Monitor],
+    position: [i32; 2],
+    point: (i32, i32),
+) -> Option<(i32, i32)> {
+    let (x, y) = in_layout(position, point);
+    let sideways =
+        on_screen(peer, (point.0 - 1, point.1)) || on_screen(peer, (point.0 + 1, point.1));
+    let upwards =
+        on_screen(peer, (point.0, point.1 - 1)) || on_screen(peer, (point.0, point.1 + 1));
+    home.iter()
+        .filter_map(|m| {
+            if sideways && (m.x..m.x + m.width).contains(&x) {
+                Some((x, y.clamp(m.y, m.y + m.height - 1)))
+            } else if upwards && (m.y..m.y + m.height).contains(&y) {
+                Some((x.clamp(m.x, m.x + m.width - 1), y))
+            } else {
+                None
+            }
+        })
+        .min_by_key(|&(hx, hy)| (hx - x).abs() + (hy - y).abs())
+}
+
 /// The stretches of this desktop's edges that lead to a placed peer, as
 /// `(x1, y1, x2, y2)` lines just outside the monitors: where a GNOME or
 /// KDE PC puts its InputCapture barriers (PRD 0004, phase 2). `peers` are
@@ -212,6 +244,25 @@ mod tests {
             width,
             height,
         }
+    }
+
+    #[test]
+    fn back_near_comes_home_below_the_shared_stretch() {
+        // The firebee desk: a TV, the laptop (1280x720 at 2560,508) and the
+        // NIVA (1920x1080) to the right of the laptop, at 3840,689.
+        let home = [m(0, 0, 2560, 1080), m(2560, 508, 1280, 720)];
+        let niva = [m(0, 0, 1920, 1080)];
+        let at = [3840, 689];
+        // Out the left edge high up: straight across, as before.
+        assert_eq!(back(&home, at, (-1, 100)), Some((3839, 789)));
+        // Lower down nothing of this PC is there...
+        assert_eq!(back(&home, at, (-1, 900)), None);
+        // ...so it lands at the bottom of the laptop, in that column.
+        assert_eq!(back_near(&home, &niva, at, (-1, 900)), Some((3839, 1227)));
+        // Out the right edge or the bottom, where nothing of this PC is in
+        // line: stays over there.
+        assert_eq!(back_near(&home, &niva, at, (1920, 900)), None);
+        assert_eq!(back_near(&home, &niva, at, (500, 1080)), None);
     }
 
     #[test]

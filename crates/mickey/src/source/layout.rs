@@ -55,8 +55,12 @@ pub(super) fn landing(
         return Some(Landing::Home(here));
     }
     let here = edges::in_layout(position, off);
-    let (index, there) = edge_crossed(positions, peers, here, input)?;
-    Some(Landing::Peer(index, there))
+    if let Some((index, there)) = edge_crossed(positions, peers, here, input) {
+        return Some(Landing::Peer(index, there));
+    }
+    // Part of that edge sticks out past this PC's monitors: home anyway,
+    // to the nearest point along the side it pushed through.
+    edges::back_near(this_pc, &peers[from].monitors, position, off).map(Landing::Home)
 }
 
 /// After the owner placed PCs in the settings window: takes the positions

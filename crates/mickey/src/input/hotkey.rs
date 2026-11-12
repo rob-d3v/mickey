@@ -18,6 +18,13 @@ use std::time::{Duration, Instant};
 /// Evdev codes of the two keys the escape uses.
 pub const KEY_RIGHTSHIFT: u16 = 54;
 pub const KEY_RIGHTALT: u16 = 100;
+/// Evdev codes of the Super (Windows) keys: tapped twice, alone, home.
+pub const KEY_LEFTMETA: u16 = 125;
+pub const KEY_RIGHTMETA: u16 = 126;
+/// Two Super taps closer than this are the way home.
+pub const SUPER_TAP_WINDOW: Duration = Duration::from_millis(400);
+/// A Super held longer than this is no tap (Super+drag, a slow chord).
+pub const SUPER_TAP_MAX: Duration = Duration::from_millis(300);
 
 /// What a hotkey asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,11 +90,62 @@ struct Escape {
     held: bool,
     /// Another key or a click while holding.
     spoiled: bool,
+    /// Super is down (either one), since then, and nothing else came.
+    super_since: Option<Instant>,
+    super_spoiled: bool,
+    /// When the last lone Super tap ended, waiting for a second one.
+    super_tap: Option<Instant>,
 }
 
 impl Escape {
-    /// Whether `event` completes the escape.
+    /// Whether `event` completes the escape: the long hold of Right Shift,
+    /// or Super tapped twice quickly with nothing else in between (omakvm:
+    /// the owner's way home from a kiosk where the edge leads nowhere).
     fn feed(&mut self, event: InputEvent, now: Instant) -> bool {
+        self.super_double_tap(event, now) | self.long_hold(event, now)
+    }
+
+    fn super_double_tap(&mut self, event: InputEvent, now: Instant) -> bool {
+        match event {
+            InputEvent::Key {
+                code: KEY_LEFTMETA | KEY_RIGHTMETA,
+                pressed: true,
+            } => {
+                // Auto-repeat keeps the first press time.
+                if self.super_since.is_none() {
+                    self.super_since = Some(now);
+                    self.super_spoiled = false;
+                }
+            }
+            InputEvent::Key {
+                code: KEY_LEFTMETA | KEY_RIGHTMETA,
+                pressed: false,
+            } => {
+                let tap = self.super_since.take().is_some_and(|since| {
+                    !self.super_spoiled && now.duration_since(since) <= SUPER_TAP_MAX
+                });
+                if !tap {
+                    self.super_tap = None;
+                } else if self
+                    .super_tap
+                    .is_some_and(|last| now.duration_since(last) <= SUPER_TAP_WINDOW)
+                {
+                    self.super_tap = None;
+                    return true;
+                } else {
+                    self.super_tap = Some(now);
+                }
+            }
+            InputEvent::Key { pressed: true, .. } | InputEvent::Button { pressed: true, .. } => {
+                self.super_spoiled = true;
+                self.super_tap = None;
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn long_hold(&mut self, event: InputEvent, now: Instant) -> bool {
         match event {
             InputEvent::Key {
                 code: KEY_RIGHTSHIFT,
@@ -495,6 +553,75 @@ mod tests {
             (key(ALT, false), 2210),
         ];
         assert!(!press(&mut Hotkey::from_config(&set), &spoiled).contains(&Trigger::Home));
+    }
+
+    #[test]
+    fn super_tapped_twice_comes_home() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let press = |events: &[(InputEvent, u64)]| {
+            let mut hotkey = Hotkey::new();
+            let mut fired = Vec::new();
+            for &(event, ms) in events {
+                fired.extend(hotkey.feed_at(event, at(ms), |_| {}));
+            }
+            fired
+        };
+        const SUPER: u16 = KEY_LEFTMETA;
+        let twice = |gap: u64| {
+            [
+                (key(SUPER, true), 0),
+                (key(SUPER, false), 80),
+                (key(SUPER, true), 80 + gap),
+                (key(SUPER, false), 160 + gap),
+            ]
+        };
+        assert_eq!(press(&twice(150)), [Trigger::Home], "quick: home");
+        assert_eq!(press(&twice(600)), [], "too slow: nothing");
+        // Either Super, and mixed.
+        assert_eq!(
+            press(&[
+                (key(KEY_RIGHTMETA, true), 0),
+                (key(KEY_RIGHTMETA, false), 50),
+                (key(SUPER, true), 150),
+                (key(SUPER, false), 200),
+            ]),
+            [Trigger::Home]
+        );
+        // Super+Q then Super: a chord, not a tap.
+        assert_eq!(
+            press(&[
+                (key(SUPER, true), 0),
+                (key(Q, true), 30),
+                (key(Q, false), 60),
+                (key(SUPER, false), 90),
+                (key(SUPER, true), 200),
+                (key(SUPER, false), 250),
+            ]),
+            []
+        );
+        // A key typed between the taps.
+        assert_eq!(
+            press(&[
+                (key(SUPER, true), 0),
+                (key(SUPER, false), 50),
+                (key(Q, true), 100),
+                (key(Q, false), 120),
+                (key(SUPER, true), 200),
+                (key(SUPER, false), 250),
+            ]),
+            []
+        );
+        // Held long: no tap.
+        assert_eq!(
+            press(&[
+                (key(SUPER, true), 0),
+                (key(SUPER, false), 800),
+                (key(SUPER, true), 900),
+                (key(SUPER, false), 950),
+            ]),
+            []
+        );
     }
 
     #[test]
